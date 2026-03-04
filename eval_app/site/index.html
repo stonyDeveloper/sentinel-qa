@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BookNook - Buy Books</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>BookNook</h1>
+    <input id="search" type="search" placeholder="Search books..." aria-label="Search books">
+  </header>
+  <main>
+    <section id="products"></section>
+    <aside id="cart">
+      <h2>Your cart (<span id="cartCount">0</span>)</h2>
+      <ul id="cartItems"></ul>
+      <p class="totals">Subtotal: <span id="subtotal">$0.00</span></p>
+      <p class="totals">Total: <span id="total">$0.00</span></p>
+      <button id="checkoutBtn">Checkout</button>
+    </aside>
+  </main>
+
+  <div id="modal" class="hidden">
+    <form id="checkoutForm">
+      <h2>Checkout</h2>
+      <input id="name" placeholder="Full name" autocomplete="off">
+      <input id="email" placeholder="Email address" autocomplete="off">
+      <input id="address" placeholder="Delivery address" autocomplete="off">
+      <button id="placeOrder" type="submit">Place order</button>
+      <button id="closeModal" type="button">Close</button>
+    </form>
+  </div>
+
+  <div id="success" class="hidden">
+    <h2>Order placed</h2>
+    <p id="successText"></p>
+    <button id="successClose" type="button">Close</button>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
