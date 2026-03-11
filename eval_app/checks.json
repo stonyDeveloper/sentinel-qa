@@ -1,0 +1,37 @@
+[
+  {
+    "id": "qty_total",
+    "check": "After changing an item's quantity in the cart, the subtotal and total update to qty x price.",
+    "bug_present": true
+  },
+  {
+    "id": "qty_floor",
+    "check": "A cart item's quantity can never go below 1.",
+    "bug_present": true
+  },
+  {
+    "id": "email_valid",
+    "check": "Checkout rejects an invalid email address.",
+    "bug_present": true
+  },
+  {
+    "id": "remove_item",
+    "check": "Clicking Remove on a cart row deletes only that row.",
+    "bug_present": true
+  },
+  {
+    "id": "search_filter",
+    "check": "Typing in the Search box filters the product list.",
+    "bug_present": true
+  },
+  {
+    "id": "cart_add",
+    "check": "Clicking Add to cart puts the item in the cart with a correct count.",
+    "bug_present": false
+  },
+  {
+    "id": "stock_badge",
+    "check": "Books show their stock status (In stock / Out of stock) correctly.",
+    "bug_present": false
+  }
+]
