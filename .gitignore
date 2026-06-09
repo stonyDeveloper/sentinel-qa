@@ -1,0 +1,24 @@
+# secrets
+.env
+
+# python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# runtime artifacts
+gui/jobs/
+screenshots/
+reports/
+eval_app/eval-results-*.json
+
+# scratch notes
+qa_agent_explained.md
+
+# frontend tooling (dist is committed and served by the server)
+gui/frontend/node_modules/
+
+# misc
+.DS_Store
+.pytest_cache/
