@@ -1,0 +1,13 @@
+venv
+__pycache__
+*.pyc
+.env
+.git
+gui/jobs
+screenshots
+gui/frontend/node_modules
+gui/frontend/src
+eval_app
+reports
+*.md
+!README.md
