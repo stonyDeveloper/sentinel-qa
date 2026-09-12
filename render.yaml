@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: sentinel-qa
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_API_BASE
+        sync: false
+      - key: OPENAI_MODEL
+        value: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+      - key: QA_JOBS_DIR
+        value: "/tmp/sentinel-qa-jobs"
