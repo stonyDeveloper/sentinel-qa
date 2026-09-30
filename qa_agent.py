@@ -55,6 +55,12 @@ SHOTS_STREAM = os.getenv("QA_SHOTS_STREAM") or ""
 
 PACING_SECONDS = float(os.getenv("QA_PACING", "8"))
 LOOP_CAP = 8
+REPEAT_LIMIT = 3
+SETTLE_MS = int(os.getenv("QA_SETTLE_MS", "1600"))
+SETTLE_TOOLS = {"click", "click_selector", "click_href", "press", "type_text"}
+REPEAT_GUARD_TOOLS = {"click", "click_selector", "click_href", "type_text", "press", "hover", "navigate"}
+OAUTH_HOSTS = ("accounts.google.com", "appleid.apple.com", "login.live.com", "login.microsoftonline.com", "login.microsoft.com")
+OAUTH_PREFIXES = (("github.com", "/login"), ("linkedin.com", "/oauth"))
 
 
 def _shot_name(evidence_name: str) -> str:
@@ -126,6 +132,21 @@ def _captcha_detect() -> str:
         return ", ".join(uniq) if uniq else ""
     except Exception:
         return ""
+
+
+def _oauth_warning() -> str:
+    try:
+        url = page.url
+    except Exception:
+        return ""
+    host = (urlparse(url).hostname or "").lower()
+    if host in OAUTH_HOSTS:
+        return host
+    path = urlparse(url).path
+    for h, prefix in OAUTH_PREFIXES:
+        if host == h and path.startswith(prefix):
+            return h
+    return ""
 
 
 @tool
@@ -306,12 +327,32 @@ def type_text(placeholder_or_label: str, value: str) -> str:
     if locator.count() == 0:
         locator = page.get_by_label(placeholder_or_label, exact=False)
     target = locator.first
-    target.click()
+    how = "typed"
     try:
-        target.press_sequentially(value, delay=random.randint(28, 85))
+        target.click(timeout=4000)
+        try:
+            target.press_sequentially(value, delay=random.randint(28, 85))
+        except Exception:
+            target.fill(value)
+            how = "filled"
     except Exception:
-        target.fill(value)
-    return f"Typed '{value}' into field '{placeholder_or_label}'"
+        try:
+            target.fill(value, timeout=4000)
+            how = "filled"
+        except Exception:
+            target.evaluate(
+                """(el, v) => {
+                    const proto = el.constructor.prototype;
+                    const set = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (set && set.set) set.set.call(el, v);
+                    el.value = v;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }""",
+                value,
+            )
+            how = "js-set"
+    return f"Typed '{value}' into field '{placeholder_or_label}' ({how})"
 
 
 @tool
@@ -426,6 +467,7 @@ Rules:
 - Hover-only elements (like delete buttons) need hover() first, then click_selector().
 - Look for broken flows, wrong content, missing states, errors, or UX problems.
 - CAPTCHA policy: read_page will flag '[automated-verification detected: ...]' when a CapTCHA (Turnstile/hCaptcha/reCAPTCHA) is on screen. If you see a human-verification checkbox ('Verify you are human', 'I\'m not a robot'), click it ONCE with click() on its label text, then wait and read the page. If a challenge still blocks the required flow, do NOT keep retrying: take a screenshot and honestly report the flow as blocked by the verification challenge in your final report.
+- Identity providers: if you land on an identity-provider login page (accounts.google.com, appleid.apple.com, login.microsoftonline.com, a GitHub sign-in page), do NOT create accounts or enter credentials there. Navigate back to the app under test; if signing in through that provider is required by the task, report it as unverifiable in your final verdict.
 - Forms: if clicking a submit button by its text times out, the label may differ from what you guessed. Re-read the page to see the real button text, or press('Enter') while the last field is focused as a fallback.
 - Icon buttons (a social/share icon, a search magnifier, etc.) usually have NO visible text. read_page will show them as '(a:Twitter)' style hints, and get_links() lists them by their aria-label or alt. Use click_href() with a piece of their URL or click_selector('[aria-label="Twitter"]') rather than click() on text that isn't there.
 - After clicking a social link, a new tab may open (get_links also reveals the target). Verify the destination loaded in the new tab, then close_tab() to return.
@@ -453,6 +495,8 @@ def run_agent(url: str, goal: str) -> tuple[str, list, list]:
     screenshots: list[str] = []
     SHOT_DATA.clear()
     consecutive: dict[str, int] = {}
+    seen: dict[str, int] = {}
+    oauth_warned = False
     last_call = 0.0
 
     for _ in range(max_steps):
@@ -567,9 +611,23 @@ def run_agent(url: str, goal: str) -> tuple[str, list, list]:
                     consecutive[name] = 0
             else:
                 consecutive = {}
+            if not guarded and name in REPEAT_GUARD_TOOLS:
+                key = name + "|" + json.dumps(args, sort_keys=True)
+                seen[key] = seen.get(key, 0) + 1
+                if seen[key] >= REPEAT_LIMIT:
+                    seen.clear()
+                    result = (
+                        f"Repeat guard: you have already called {name} with these exact "
+                        f"arguments {REPEAT_LIMIT} times without a different action resolving "
+                        "the situation. Do NOT call this again. Use read_page to inspect the "
+                        "real page state and try a different element, or write your final report."
+                    )
+                    guarded = True
             if not guarded:
                 try:
                     result = fn.invoke(args)
+                    if name in SETTLE_TOOLS:
+                        page.wait_for_timeout(SETTLE_MS)
                     opened = _sync_tabs()
                     if opened:
                         result = (
@@ -578,6 +636,30 @@ def run_agent(url: str, goal: str) -> tuple[str, list, list]:
                         )
                 except Exception as exc:
                     result = f"ERROR executing tool '{name}': {exc}"
+            if not guarded:
+                oauth = _oauth_warning()
+                if oauth and not oauth_warned:
+                    oauth_warned = True
+                    result = (
+                        f"{result}\n[WARNING: you are now on {oauth}, an identity-provider "
+                        "login page. Do NOT create accounts or type personal information here. "
+                        "Navigate back to the app under test; if signing in through this provider "
+                        "is required for the task, report it as unverifiable in your final verdict.]"
+                    )
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are on an identity-provider login page ("
+                                + oauth
+                                + "). Do not create an account and do not type any personal "
+                                "information there. Navigate back to the app under test. If "
+                                "sign-in through this provider is required for the assigned "
+                                "task, finish with a final report stating the flow is "
+                                "unverifiable through this provider."
+                            ),
+                        }
+                    )
             print(f"\n[{name} {args}]")
             actions.append({"name": name, "args": args, "result": str(result)})
             if name == "screenshot":
