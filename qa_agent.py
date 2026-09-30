@@ -2,10 +2,12 @@ import argparse
 import base64
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -15,9 +17,36 @@ from report import generate_report
 
 load_dotenv(override=True)
 
+CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+]
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+"""
+CAPTCHA_SELECTOR = (
+    "iframe[src*='turnstile'], iframe[src*='hcaptcha'], iframe[src*='recaptcha'], "
+    "iframe[src*='challenges.cloudflare.com'], .cf-turnstile, .h-captcha, .g-recaptcha, "
+    "[data-sitekey]"
+)
+
 _pw = sync_playwright().start()
-browser = _pw.chromium.launch(headless=True)
-context = browser.new_context(viewport={"width": 1280, "height": 800})
+browser = _pw.chromium.launch(headless=True, args=LAUNCH_ARGS)
+context = browser.new_context(
+    viewport={"width": 1280, "height": 800},
+    user_agent=CHROME_UA,
+    locale="en-US",
+    timezone_id="UTC",
+)
+context.add_init_script(STEALTH_JS)
 page = context.new_page()
 page.set_default_timeout(8000)
 
@@ -43,6 +72,60 @@ def _append_shot(name: str, png: bytes) -> None:
             f.write(json.dumps({"name": name, "png": base64.b64encode(png).decode("ascii")}) + "\n")
     except OSError:
         pass
+
+
+def _session_path(url: str):
+    host = (urlparse(url).hostname or "").lower().replace(":", "_")
+    base = os.getenv("QA_SESSIONS_DIR", "sessions")
+    if not host or not base:
+        return None
+    return Path(base) / (host + ".json")
+
+
+def _load_session(url: str) -> None:
+    p = _session_path(url)
+    if p is None or not p.exists():
+        return
+    try:
+        state = json.loads(p.read_text(encoding="utf-8"))
+        if state.get("cookies"):
+            context.add_cookies(state["cookies"])
+        print(f"\n[loaded saved session: {p}]")
+    except Exception as exc:
+        print(f"[session load failed: {exc}]")
+
+
+def _save_session(url: str) -> None:
+    p = _session_path(url)
+    if p is None:
+        return
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        state = context.storage_state()
+        p.write_text(json.dumps(state), encoding="utf-8")
+        print(f"\n[saved session state: {p}]")
+    except Exception as exc:
+        print(f"[session save failed: {exc}]")
+
+
+def _captcha_detect() -> str:
+    try:
+        found = page.eval_on_selector_all(
+            CAPTCHA_SELECTOR,
+            """els => els.slice(0, 4).map(e => {
+                const src = (e.getAttribute('src') || '').toLowerCase();
+                const cls = ((e.className || '') + ' ' + (e.getAttribute('data-sitekey') ? 'sitekey' : '')).toLowerCase();
+                const combo = src + ' ' + cls;
+                if (combo.includes('turnstile') || combo.includes('challenges.cloudflare')) return 'Turnstile';
+                if (combo.includes('hcaptcha')) return 'hCaptcha';
+                if (combo.includes('recaptcha')) return 'reCAPTCHA';
+                return 'captcha-widget';
+            })""",
+        )
+        uniq = sorted(set(found))
+        return ", ".join(uniq) if uniq else ""
+    except Exception:
+        return ""
 
 
 @tool
@@ -87,7 +170,7 @@ const hints = [...document.querySelectorAll('a[aria-label],button[aria-label],[r
                     const r = e.getBoundingClientRect();
                     return r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
                 })
-                .filter(e => (e.closest('a').innerText || '').trim().length === 0)
+                .filter(e => (e.closest('a')?.innerText || '').trim().length === 0)
                 .map(e => {
                     const a = e.closest('a') || e;
                     const aria = a.getAttribute('aria-label');
@@ -106,6 +189,9 @@ const hints = [...document.querySelectorAll('a[aria-label],button[aria-label],[r
                 return out.join(' | ').slice(0, 2000);
             }"""
         )
+        cap = _captcha_detect()
+        if cap:
+            body += f"\n[automated-verification detected: {cap}]"
         return base + "\n" + body
     except Exception as exc:
         return f"ERROR reading page: {exc}"
@@ -219,7 +305,12 @@ def type_text(placeholder_or_label: str, value: str) -> str:
     locator = page.get_by_placeholder(placeholder_or_label, exact=False)
     if locator.count() == 0:
         locator = page.get_by_label(placeholder_or_label, exact=False)
-    locator.first.fill(value)
+    target = locator.first
+    target.click()
+    try:
+        target.press_sequentially(value, delay=random.randint(28, 85))
+    except Exception:
+        target.fill(value)
     return f"Typed '{value}' into field '{placeholder_or_label}'"
 
 
@@ -334,7 +425,8 @@ Rules:
   or click its close button before continuing.
 - Hover-only elements (like delete buttons) need hover() first, then click_selector().
 - Look for broken flows, wrong content, missing states, errors, or UX problems.
-- The 'adopted' text is the one given to the user. 
+- CAPTCHA policy: read_page will flag '[automated-verification detected: ...]' when a CapTCHA (Turnstile/hCaptcha/reCAPTCHA) is on screen. If you see a human-verification checkbox ('Verify you are human', 'I\'m not a robot'), click it ONCE with click() on its label text, then wait and read the page. If a challenge still blocks the required flow, do NOT keep retrying: take a screenshot and honestly report the flow as blocked by the verification challenge in your final report.
+- Forms: if clicking a submit button by its text times out, the label may differ from what you guessed. Re-read the page to see the real button text, or press('Enter') while the last field is focused as a fallback.
 - Icon buttons (a social/share icon, a search magnifier, etc.) usually have NO visible text. read_page will show them as '(a:Twitter)' style hints, and get_links() lists them by their aria-label or alt. Use click_href() with a piece of their URL or click_selector('[aria-label="Twitter"]') rather than click() on text that isn't there.
 - After clicking a social link, a new tab may open (get_links also reveals the target). Verify the destination loaded in the new tab, then close_tab() to return.
 - Take a screenshot whenever you find something that looks like a bug.
@@ -532,6 +624,8 @@ def main() -> None:
         print("Copy .env.example to .env and paste in your key.")
         return
 
+    _load_session(args.url)
+
     print(f"\n>>> Testing {args.url}")
     print(f">>> Goal: {args.goal}")
     print(f">>> Model: {os.getenv('OPENAI_MODEL')}\n")
@@ -540,6 +634,8 @@ def main() -> None:
 
     print("\n=== FINAL REPORT ===")
     print(final)
+
+    _save_session(args.url)
 
     browser.close()
     _pw.stop()

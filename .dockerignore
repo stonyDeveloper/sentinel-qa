@@ -5,6 +5,7 @@ __pycache__
 .git
 gui/jobs
 screenshots
+sessions
 gui/frontend/node_modules
 gui/frontend/src
 eval_app

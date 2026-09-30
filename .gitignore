@@ -12,6 +12,7 @@ gui/jobs/
 screenshots/
 reports/
 eval_app/eval-results-*.json
+sessions/
 
 # scratch notes
 qa_agent_explained.md
