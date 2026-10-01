@@ -57,10 +57,18 @@ PACING_SECONDS = float(os.getenv("QA_PACING", "8"))
 LOOP_CAP = 8
 REPEAT_LIMIT = 3
 SETTLE_MS = int(os.getenv("QA_SETTLE_MS", "1600"))
-SETTLE_TOOLS = {"click", "click_selector", "click_href", "press", "type_text"}
+SETTLE_TOOLS = {"type_text", "click_href"}
 REPEAT_GUARD_TOOLS = {"click", "click_selector", "click_href", "type_text", "press", "hover", "navigate"}
-OAUTH_HOSTS = ("accounts.google.com", "appleid.apple.com", "login.live.com", "login.microsoftonline.com", "login.microsoft.com")
-OAUTH_PREFIXES = (("github.com", "/login"), ("linkedin.com", "/oauth"))
+OAUTH_HOSTS = (
+    "accounts.google.com", "appleid.apple.com", "login.live.com",
+    "login.microsoftonline.com", "login.microsoft.com", "login.yahoo.com",
+    "id.twitch.tv", "open.spotify.com",
+)
+OAUTH_PREFIXES = (
+    ("github.com", "/login"), ("x.com", "/i/flow/login"),
+    ("twitter.com", "/i/flow/login"), ("linkedin.com", "/oauth"),
+    ("www.facebook.com", "/login"), ("discord.com", "/oauth2"),
+)
 
 
 def _shot_name(evidence_name: str) -> str:
@@ -149,6 +157,18 @@ def _oauth_warning() -> str:
     return ""
 
 
+def _oauth_block() -> str:
+    host = _oauth_warning()
+    if not host:
+        return ""
+    return (
+        f"BLOCKED: the browser is on {host}, an identity-provider login page, so the "
+        "engine refuses to interact with it. Navigate back to the app under test or, if "
+        "signing in through this provider is required for the task, report the flow as "
+        "unverifiable."
+    )
+
+
 @tool
 def navigate(url: str) -> str:
     """Navigate the browser to a URL. Returns the page title so you know you got there. Resets to a single tab."""
@@ -221,22 +241,31 @@ const hints = [...document.querySelectorAll('a[aria-label],button[aria-label],[r
 @tool
 def click(text: str) -> str:
     """Click an element by its visible text (e.g. 'Add', 'Submit', 'Delete'). Returns new page text."""
+    oauth = _oauth_block()
+    if oauth:
+        return oauth
     page.get_by_text(text, exact=True).first.click()
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(SETTLE_MS)
     return page.inner_text("body")[:3000]
 
 
 @tool
 def click_selector(selector: str) -> str:
     """Click the first element matching a CSS selector (e.g. '.toggle', '[data-testid="delete"]'). Use for elements without visible text."""
+    oauth = _oauth_block()
+    if oauth:
+        return oauth
     page.locator(selector).first.click()
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(SETTLE_MS)
     return page.inner_text("body")[:3000]
 
 
 @tool
 def hover(text: str) -> str:
     """Hover over an element by its visible text. Required before interacting with hover-only elements like delete buttons."""
+    oauth = _oauth_block()
+    if oauth:
+        return oauth
     page.get_by_text(text, exact=True).first.hover()
     page.wait_for_timeout(300)
     return f"Hovered over '{text}'."
@@ -280,7 +309,11 @@ def get_links() -> str:
 @tool
 def click_href(substring: str) -> str:
     """Click the first link whose URL contains the given substring (e.g. 'medium.com'). Use for following links instead of guessing visible text."""
-    page.locator(f"a[href*='{substring}']").first.click()
+    oauth = _oauth_block()
+    if oauth:
+        return oauth
+    safe = substring.replace("\\", "\\\\").replace("'", "\\'")
+    page.locator(f"a[href*='{safe}']").first.click()
     page.wait_for_timeout(300)
     return f"Clicked first link whose URL contains '{substring}'."
 
@@ -323,6 +356,9 @@ def scroll_to_text(text: str) -> str:
 @tool
 def type_text(placeholder_or_label: str, value: str) -> str:
     """Type text into an input field. Use the field's placeholder text or aria-label to find it."""
+    oauth = _oauth_block()
+    if oauth:
+        return oauth
     locator = page.get_by_placeholder(placeholder_or_label, exact=False)
     if locator.count() == 0:
         locator = page.get_by_label(placeholder_or_label, exact=False)
@@ -358,8 +394,11 @@ def type_text(placeholder_or_label: str, value: str) -> str:
 @tool
 def press(key: str) -> str:
     """Press a keyboard key like 'Enter' or 'Escape'. Returns new page text."""
+    oauth = _oauth_block()
+    if oauth:
+        return oauth
     page.keyboard.press(key)
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(SETTLE_MS)
     return page.inner_text("body")[:3000]
 
 
@@ -495,7 +534,8 @@ def run_agent(url: str, goal: str) -> tuple[str, list, list]:
     screenshots: list[str] = []
     SHOT_DATA.clear()
     consecutive: dict[str, int] = {}
-    seen: dict[str, int] = {}
+    last_key = ""
+    streak = 0
     oauth_warned = False
     last_call = 0.0
 
@@ -523,6 +563,14 @@ def run_agent(url: str, goal: str) -> tuple[str, list, list]:
                 message = str(
                     body.get("error", {}).get("message", body.get("errors", ""))
                 )
+                if re.search(
+                    r"quota|exceeded|exhausted|daily.*limit|budget", message, re.I
+                ):
+                    return (
+                        "Halted mid-run: the model provider's free allowance/daily quota is "
+                        f"exhausted (HTTP {status}). No final verdict was produced.\n\nDetail: {message[:400]}",
+                        actions, screenshots,
+                    )
                 match = re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", message)
                 if match:
                     wait = int(match.group(1)) * 60 + float(match.group(2))
@@ -613,14 +661,16 @@ def run_agent(url: str, goal: str) -> tuple[str, list, list]:
                 consecutive = {}
             if not guarded and name in REPEAT_GUARD_TOOLS:
                 key = name + "|" + json.dumps(args, sort_keys=True)
-                seen[key] = seen.get(key, 0) + 1
-                if seen[key] >= REPEAT_LIMIT:
-                    seen.clear()
+                if key == last_key:
+                    streak += 1
+                else:
+                    last_key, streak = key, 1
+                if streak >= REPEAT_LIMIT:
                     result = (
                         f"Repeat guard: you have already called {name} with these exact "
-                        f"arguments {REPEAT_LIMIT} times without a different action resolving "
-                        "the situation. Do NOT call this again. Use read_page to inspect the "
-                        "real page state and try a different element, or write your final report."
+                        f"arguments {REPEAT_LIMIT} times consecutively without a different action "
+                        "resolving the situation. Do NOT call this again. Use read_page to inspect "
+                        "the real page state and try a different element, or write your final report."
                     )
                     guarded = True
             if not guarded:
@@ -642,23 +692,9 @@ def run_agent(url: str, goal: str) -> tuple[str, list, list]:
                     oauth_warned = True
                     result = (
                         f"{result}\n[WARNING: you are now on {oauth}, an identity-provider "
-                        "login page. Do NOT create accounts or type personal information here. "
-                        "Navigate back to the app under test; if signing in through this provider "
-                        "is required for the task, report it as unverifiable in your final verdict.]"
-                    )
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are on an identity-provider login page ("
-                                + oauth
-                                + "). Do not create an account and do not type any personal "
-                                "information there. Navigate back to the app under test. If "
-                                "sign-in through this provider is required for the assigned "
-                                "task, finish with a final report stating the flow is "
-                                "unverifiable through this provider."
-                            ),
-                        }
+                        "login page. The engine blocks actions there. Navigate back to the app "
+                        "under test; if signing in through this provider is required for the "
+                        "task, report it as unverifiable in your final verdict.]"
                     )
             print(f"\n[{name} {args}]")
             actions.append({"name": name, "args": args, "result": str(result)})
@@ -671,7 +707,10 @@ def run_agent(url: str, goal: str) -> tuple[str, list, list]:
             )
 
         if len(messages) >= 24:
-            messages = messages[:2] + messages[-12:]
+            tail = messages[-12:]
+            while tail and tail[0]["role"] != "assistant":
+                tail = tail[1:]
+            messages = messages[:2] + tail
 
     return (f"Reached {max_steps}-action limit without a final verdict.",
             actions, screenshots)
@@ -695,7 +734,7 @@ def main() -> None:
     parser.add_argument(
         "--format",
         choices=["md", "html", "pdf", "all"],
-        default=["md"],
+        default=None,
         action="append",
         help="Report format(s) to generate (repeatable; 'all' = md, html, pdf)",
     )
